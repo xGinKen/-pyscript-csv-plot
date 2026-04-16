@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>PyScript CSV Plot</title>
+  <link rel="stylesheet" href="https://pyscript.net/releases/2026.3.1/core.css">
+  <script type="module" src="https://pyscript.net/releases/2026.3.1/core.js"></script>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      max-width: 960px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+      color: #222;
+    }
+    h1 { font-size: 1.4rem; }
+    .controls {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 0.6rem 1rem;
+      align-items: center;
+      margin-bottom: 1rem;
+    }
+    .controls label { font-weight: 600; }
+    select, input[type="file"], button {
+      font-size: 0.95rem;
+      padding: 0.3rem 0.5rem;
+    }
+    button {
+      cursor: pointer;
+      background: #2563eb;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      padding: 0.5rem 1rem;
+    }
+    button:hover { background: #1d4ed8; }
+    #status {
+      margin: 0.5rem 0;
+      color: #555;
+      font-size: 0.9rem;
+      min-height: 1.2em;
+    }
+    #status.error { color: #b91c1c; }
+    #plot-area {
+      margin-top: 1rem;
+      border: 1px solid #e5e7eb;
+      border-radius: 6px;
+      padding: 0.5rem;
+      min-height: 360px;
+      background: #fafafa;
+    }
+    #plot-area img { max-width: 100%; height: auto; }
+  </style>
+</head>
+<body>
+  <h1>PyScript CSV Plot</h1>
+  <p>CSV ファイルを選んで、X 軸・Y 軸の列を指定すると折れ線グラフを描画します。</p>
+
+  <div class="controls">
+    <label for="csv-file">CSV ファイル:</label>
+    <input type="file" id="csv-file" accept=".csv">
+
+    <label for="x-col">X 軸:</label>
+    <select id="x-col"></select>
+
+    <label for="y-cols">Y 軸 (複数選択可):</label>
+    <select id="y-cols" multiple size="6"></select>
+
+    <label for="chart-type">グラフ種別:</label>
+    <select id="chart-type">
+      <option value="line">折れ線</option>
+      <option value="bar">棒</option>
+    </select>
+
+    <span></span>
+    <button id="plot-btn">Plot</button>
+  </div>
+
+  <div id="status">Pyodide を読み込み中... （初回は数秒かかります）</div>
+  <div id="plot-area"></div>
+
+  <script type="py" config='{"packages": ["pandas", "matplotlib"]}'>
+import warnings
+# pandas 3.0 の pyarrow 予告警告と matplotlib のグリフ欠落警告を抑制
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=UserWarning, message=r"Glyph .* missing from current font")
+
+import asyncio
+import base64
+import numpy as np
+import pandas as pd
+import matplotlib
+import matplotlib.pyplot as plt
+from io import StringIO, BytesIO
+from pyscript import document, when
+from pyodide.http import pyfetch
+
+# マイナス記号が豆腐になる対策
+matplotlib.rcParams["axes.unicode_minus"] = False
+
+state = {"df": None, "font_task": None, "font_ok": False}
+
+FONT_URL = "https://cdn.jsdelivr.net/gh/uehara1414/japanize-matplotlib@master/japanize_matplotlib/fonts/ipaexg.ttf"
+FONT_PATH = "/tmp/ipaexg.ttf"
+
+
+def _set_status(msg, is_error=False):
+    el = document.querySelector("#status")
+    el.innerText = msg
+    if is_error:
+        el.classList.add("error")
+    else:
+        el.classList.remove("error")
+
+
+async def _load_jp_font():
+    """IPAex Gothic を CDN から取得して matplotlib に登録する。"""
+    try:
+        resp = await pyfetch(FONT_URL)
+        data = await resp.bytes()
+        with open(FONT_PATH, "wb") as f:
+            f.write(data)
+        from matplotlib import font_manager as fm
+        fm.fontManager.addfont(FONT_PATH)
+        prop = fm.FontProperties(fname=FONT_PATH)
+        matplotlib.rcParams["font.family"] = prop.get_name()
+        state["font_ok"] = True
+    except Exception as e:
+        print(f"Font load failed: {e}")
+
+
+# 起動と同時にフォント取得を開始（非ブロッキング）
+state["font_task"] = asyncio.ensure_future(_load_jp_font())
+
+_set_status("準備完了。CSV ファイルを選択してください。（日本語フォントをバックグラウンドで取得中）")
+
+
+def _populate_selects(columns):
+    x_sel = document.querySelector("#x-col")
+    y_sel = document.querySelector("#y-cols")
+    x_sel.innerHTML = ""
+    y_sel.innerHTML = ""
+    for col in columns:
+        ox = document.createElement("option")
+        ox.value = col
+        ox.text = col
+        oy = document.createElement("option")
+        oy.value = col
+        oy.text = col
+        x_sel.appendChild(ox)
+        y_sel.appendChild(oy)
+
+
+@when("change", "#csv-file")
+async def on_file(event):
+    files = event.target.files
+    if files is None or files.length == 0:
+        return
+    file = files.item(0)
+    if file is None:
+        return
+    try:
+        text = await file.text()
+        df = pd.read_csv(StringIO(text))
+    except Exception as e:
+        state["df"] = None
+        _set_status(f"CSV の読み込みに失敗しました: {e}", is_error=True)
+        return
+    state["df"] = df
+    _populate_selects(list(df.columns))
+    _set_status(f"{file.name} を読み込みました ({len(df)} 行, {len(df.columns)} 列)")
+
+
+@when("click", "#plot-btn")
+async def on_plot(event):
+    df = state["df"]
+    if df is None:
+        _set_status("先に CSV ファイルを選択してください。", is_error=True)
+        return
+    x_col = document.querySelector("#x-col").value
+    y_cols = [o.value for o in document.querySelectorAll("#y-cols option:checked")]
+    if not x_col or not y_cols:
+        _set_status("X 軸と Y 軸（1 つ以上）を選択してください。", is_error=True)
+        return
+
+    # フォント取得中なら待機
+    task = state.get("font_task")
+    if task is not None and not task.done():
+        _set_status("日本語フォントのダウンロードを待っています...")
+        try:
+            await task
+        except Exception:
+            pass
+
+    chart_type = document.querySelector("#chart-type").value
+
+    try:
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        n = len(df)
+        # 行数が多いときはマーカーを外す（描画が重くなるため）
+        marker = "o" if n <= 200 else None
+
+        if chart_type == "bar":
+            n_series = len(y_cols)
+            # 棒はラベル衝突を避けるため数値位置 + オフセットで配置
+            x_pos = np.arange(n)
+            width = 0.8 / n_series
+            for i, y in enumerate(y_cols):
+                offset = (i - (n_series - 1) / 2.0) * width
+                ax.bar(x_pos + offset, df[y], width=width, label=y)
+            # x 軸の目盛りラベル: データが少ないときのみ元の値を表示
+            if n <= 30:
+                ax.set_xticks(x_pos)
+                ax.set_xticklabels(
+                    df[x_col].astype(str),
+                    rotation=45 if n > 8 else 0,
+                    ha="right" if n > 8 else "center",
+                )
+            # n が大きいときは matplotlib 任せ（0, 2000, 4000, ... のような位置目盛り）
+        else:
+            for y in y_cols:
+                ax.plot(df[x_col], df[y], label=y, marker=marker, linewidth=1.2)
+
+        ax.set_xlabel(x_col)
+        ax.legend()
+        ax.grid(True, alpha=0.4)
+        fig.tight_layout()
+        buf = BytesIO()
+        fig.savefig(buf, format="png", dpi=100)
+        plt.close(fig)
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        document.querySelector("#plot-area").innerHTML = (
+            f'<img src="data:image/png;base64,{b64}">'
+        )
+        _set_status(f"描画しました: {chart_type} / X={x_col}, Y={', '.join(y_cols)}")
+    except Exception as e:
+        _set_status(f"描画に失敗しました: {e}", is_error=True)
+  </script>
+</body>
+</html>
